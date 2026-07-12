@@ -53,13 +53,11 @@ target_compile_definitions(urdf PUBLIC ${TESSERACT_COMPILE_DEFINITIONS})
 # later destroys them -> heap corruption ("munmap_chunk(): invalid pointer" at Release; latent under
 # O0 where symbol-binding luck masked it). Strip the arch flags off the imported PCL targets before
 # linking them; point-cloud parsing does not need host-specific SIMD codegen.
-foreach(_pcl_tgt ${PCL_IO_LIBRARIES})
+# (probe-verified: each pcl_* target's INTERFACE_COMPILE_OPTIONS contains ONLY the arch genex
+#  "$<$<COMPILE_LANGUAGE:CXX>:-msse4.2;-mfpmath=sse;-march=native;-mavx2>" -> safe to wipe whole.)
+foreach(_pcl_tgt pcl_common pcl_io pcl_octree)
   if(TARGET ${_pcl_tgt})
-    get_target_property(_pcl_opts ${_pcl_tgt} INTERFACE_COMPILE_OPTIONS)
-    if(_pcl_opts)
-      list(FILTER _pcl_opts EXCLUDE REGEX "^-(march|mtune|mavx|msse|mfpmath)")
-      set_target_properties(${_pcl_tgt} PROPERTIES INTERFACE_COMPILE_OPTIONS "${_pcl_opts}")
-    endif()
+    set_target_properties(${_pcl_tgt} PROPERTIES INTERFACE_COMPILE_OPTIONS "")
   endif()
 endforeach()
 target_link_libraries(urdf PRIVATE ${PCL_IO_LIBRARIES})
