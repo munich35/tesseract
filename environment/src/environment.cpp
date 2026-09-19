@@ -66,7 +66,6 @@
 #include <console_bridge/console.h>
 
 #include <utility>
-#include <chrono>
 
 namespace tesseract::environment
 {
@@ -685,42 +684,16 @@ void Environment::Implementation::environmentChanged()
   timestamp = std::chrono::system_clock::now();
   std::vector<std::string> active_link_names = state_solver->getActiveLinkNames();
 
-  // TEMPORARY diagnostic instrumentation, not a fix — times the two setActiveCollisionObjects
-  // calls and logs each manager's registered-object count alongside the active-link count, to
-  // check whether wall time correlates with registered-object count (e.g. objects that were
-  // removed but never actually left the manager) rather than just active-link count. Remove once
-  // the investigation this supports is closed. logWarn (not logDebug) so it is visible without a
-  // log-level change on the target box.
   {
     std::unique_lock<std::shared_mutex> discrete_lock(discrete_manager_mutex);
     if (discrete_manager != nullptr)
-    {
-      std::size_t registered = discrete_manager->getCollisionObjects().size();
-      auto t0 = std::chrono::steady_clock::now();
       discrete_manager->setActiveCollisionObjects(active_link_names);
-      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      CONSOLE_BRIDGE_logWarn(
-          "[diag setActiveCollisionObjects discrete] %.3f s (registered=%zu, active=%zu)",
-          dt,
-          registered,
-          active_link_names.size());
-    }
   }
 
   {
     std::unique_lock<std::shared_mutex> continuous_lock(continuous_manager_mutex);
     if (continuous_manager != nullptr)
-    {
-      std::size_t registered = continuous_manager->getCollisionObjects().size();
-      auto t0 = std::chrono::steady_clock::now();
       continuous_manager->setActiveCollisionObjects(active_link_names);
-      double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      CONSOLE_BRIDGE_logWarn(
-          "[diag setActiveCollisionObjects continuous] %.3f s (registered=%zu, active=%zu)",
-          dt,
-          registered,
-          active_link_names.size());
-    }
   }
 
   {  // Clear JointGroup, KinematicGroup and GroupJointNames cache
