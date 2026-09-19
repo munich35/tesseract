@@ -2461,6 +2461,161 @@ EnvironmentChanges Environment::getChangesSince(std::int64_t external_rev) const
   return result;
 }
 
+bool Environment::compactHistory()
+{
+  // ---- Step 1: capture inputs under one fresh shared_lock (T-398 §7a §2.5) ----
+  std::unique_ptr<tesseract::scene_graph::SceneGraph> scene_graph_clone;
+  tesseract::srdf::KinematicsInformation kinematics_information;
+  tesseract::common::ContactManagersPluginInfo contact_managers_plugin_info;
+  std::shared_ptr<const tesseract::common::AllowedCollisionMatrix> allowed_collision_matrix;
+  tesseract::common::CollisionMarginData collision_margin_data;
+  tesseract::scene_graph::SceneState captured_state;
+  std::shared_ptr<const tesseract::common::ResourceLocator> resource_locator;
+  std::string captured_name;
+  std::int64_t captured_revision{ 0 };
+
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const auto& impl = std::as_const<Implementation>(*impl_);
+
+    if (!impl.initialized)
+      return false;
+
+    scene_graph_clone = impl.scene_graph->clone();
+    kinematics_information = impl.kinematics_information;
+    contact_managers_plugin_info = impl.contact_managers_plugin_info;
+    allowed_collision_matrix = impl.scene_graph->getAllowedCollisionMatrix();
+    collision_margin_data = impl.collision_margin_data;
+    captured_state = impl.current_state;
+    resource_locator = impl.resource_locator;
+    captured_name = impl.scene_graph->getName();
+    captured_revision = static_cast<std::int64_t>(impl.revision);
+  }
+
+  if (scene_graph_clone == nullptr)
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: scene graph clone failed, aborting");
+    return false;
+  }
+
+  // ---- Step 2: build compact entirely unlocked on the live object - build-then-swap, never
+  // swap-then-verify. Any failed step below discards this attempt and leaves the live environment
+  // completely untouched. ----
+  auto compact = std::make_unique<Environment>();
+
+  if (!compact->init(*scene_graph_clone, nullptr))
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: compact->init() failed, aborting");
+    return false;
+  }
+
+  // Re-applying AddContactManagersPluginInfoCommand both registers the plugin factory info AND
+  // restores the active discrete/continuous manager selection as a side effect - verified directly
+  // against Implementation::applyAddContactManagersPluginInfoCommand, which itself calls
+  // setActive{Discrete,Continuous}ContactManagerHelper(info.*_plugin_infos.default_plugin). There
+  // is no separate "set active manager" step needed here, despite the design doc's own phrasing
+  // listing it as if it were one - confirmed against the actual command-apply code, not assumed.
+  if (!compact->applyCommand(
+          std::make_shared<const AddContactManagersPluginInfoCommand>(contact_managers_plugin_info)))
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: re-applying contact managers plugin info failed, aborting");
+    return false;
+  }
+
+  if (!compact->applyCommand(std::make_shared<const AddKinematicsInformationCommand>(kinematics_information)))
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: re-applying kinematics information failed, aborting");
+    return false;
+  }
+
+  if (allowed_collision_matrix != nullptr)
+  {
+    if (!compact->applyCommand(std::make_shared<const ModifyAllowedCollisionsCommand>(
+            *allowed_collision_matrix, ModifyAllowedCollisionsType::REPLACE)))
+    {
+      CONSOLE_BRIDGE_logWarn(
+          "Environment::compactHistory: re-applying the allowed collision matrix failed, aborting");
+      return false;
+    }
+  }
+
+  if (!compact->applyCommand(std::make_shared<const ChangeCollisionMarginsCommand>(
+          collision_margin_data.getDefaultCollisionMargin(),
+          collision_margin_data.getCollisionMarginPairData(),
+          tesseract::common::CollisionMarginPairOverrideType::REPLACE)))
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: re-applying collision margins failed, aborting");
+    return false;
+  }
+
+  compact->setState(captured_state.joints, captured_state.floating_joints);
+  compact->setResourceLocator(resource_locator);
+
+  // Name gate (fable's A1/A2 non-negotiable): a compaction must never rename the environment.
+  // Structurally guaranteed since compact's scene graph is a clone of the live one - checked anyway
+  // rather than only asserted, since "structurally guaranteed" is a claim, not a proof.
+  if (compact->getName() != captured_name)
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: name mismatch after build ('%s' != '%s'), aborting - this "
+                           "should be structurally impossible and indicates a real bug if it ever fires",
+                           compact->getName().c_str(),
+                           captured_name.c_str());
+    return false;
+  }
+
+  // ---- Step 3: swap under one unique_lock - the ONLY code that touches the live object. ----
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  Implementation& live = *impl_;
+
+  const std::int64_t old_public_revision = live.history_offset + static_cast<std::int64_t>(live.revision);
+
+  if (static_cast<std::int64_t>(live.revision) != captured_revision)
+  {
+    // BLOCKING DEFECT fix (fable, 2026-09-19 14:5x, §2.5): something landed in the capture-to-swap
+    // gap. The draft's original claim that this is "transparently absorbed into a slightly larger
+    // discard" was wrong - it is silently REVERTED unless re-applied explicitly here.
+    const auto missed_begin = live.commands.begin() + static_cast<std::ptrdiff_t>(captured_revision);
+    Commands missed(missed_begin, live.commands.end());
+    if (!compact->applyCommands(missed))
+    {
+      CONSOLE_BRIDGE_logWarn("Environment::compactHistory: swap-time gap re-apply failed (%zu missed commands), "
+                             "aborting this attempt - the trigger will retry against a fresh capture",
+                             missed.size());
+      return false;
+    }
+  }
+
+  // Consistency fix 3 (fable, 2026-09-19 15:3x §8): setState() does not bump revision, so a
+  // joint-state-only update landing in the capture-to-swap gap is invisible to the CAS above.
+  // Re-read the live state fresh, under this same lock, and apply it - same place as the CAS, one
+  // line, no new mechanism.
+  compact->setState(live.current_state.joints, live.current_state.floating_joints);
+
+  // Carry forward callbacks - per-Environment-object registrations, not part of any command, would
+  // otherwise be silently dropped by the swap.
+  compact->impl_->event_cb = live.event_cb;
+  compact->impl_->find_tcp_cb = live.find_tcp_cb;
+
+  // T-398 §7a §2.1: floor = the external revision AT THE INSTANT OF THIS SWAP, not history_offset
+  // alone - under-refusing by the compact baseline's own size reproduces the exact silent-tail
+  // hazard the floor exists to close (§2.1's own correction to the draft's floor = offset).
+  compact->impl_->history_offset = old_public_revision - static_cast<std::int64_t>(compact->impl_->revision);
+  compact->impl_->floor_revision = old_public_revision;
+
+  // The only line that touches the live object - one atomic move-assignment.
+  impl_ = std::move(compact->impl_);
+
+  // [Open item, §6, deferred to a later pass, not this one: a distinct post-swap notification
+  // event - explicitly NOT CommandAppliedEvent, which would misrepresent a swap as "these commands
+  // were just applied" to any listener. No event fired here. §5 item 0 (fable, §2.5a) already
+  // answers the common case without one: a monitored client's own compaction is self-detected by
+  // its own rewind check (§2.7 item 5), no server-side signal needed for that case. Whether a
+  // third-party observer of a SERVER-side compaction needs a distinct signal is still open and
+  // belongs in its own review pass before anything is wired to it - not guessed at here.]
+
+  return true;
+}
+
 bool Environment::applyCommands(const std::vector<std::shared_ptr<const Command>>& commands)
 {
   bool success{ false };
