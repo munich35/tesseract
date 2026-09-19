@@ -760,7 +760,13 @@ void Environment::Implementation::triggerEnvironmentChangedCallbacks()
 {
   if (!event_cb.empty())
   {
-    CommandAppliedEvent event(commands, revision);
+    // T-398 §7a §2.6 site 5 (t51b-ur20's corrected review, 2026-09-19): translated to external,
+    // same formula as sites 1-4 - identity (offset always 0) until Phase 3 enables the trigger.
+    // motion_planner's own dual-frame client-side fix (owned by t51b-ur20, scoped against this
+    // phase) is what makes translating this site correct rather than a rebuild storm - see the
+    // design doc §6a/§2.7 item 5 for the full history of why the two obvious answers both failed.
+    const auto external_revision = static_cast<int>(history_offset + static_cast<std::int64_t>(revision));
+    CommandAppliedEvent event(commands, external_revision);
     for (const auto& cb : event_cb)
       cb.second(event);
   }
@@ -2423,6 +2429,12 @@ std::int64_t Environment::getExternalRevision() const
   std::shared_lock<std::shared_mutex> lock(mutex_);
   const auto& impl = std::as_const<Implementation>(*impl_);
   return impl.history_offset + static_cast<std::int64_t>(impl.revision);
+}
+
+void Environment::setRevisionOffset(std::int64_t offset)
+{
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  impl_->history_offset = offset;
 }
 
 std::vector<std::shared_ptr<const Command>> Environment::getCommandHistory() const
