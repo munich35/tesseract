@@ -156,6 +156,24 @@ struct Environment::Implementation
   /** @brief This is the revision number after initialization used when reset is called */
   int init_revision{ 0 };
 
+  /**
+   * @brief T-398 §7a: external_revision = history_offset + revision
+   * @details Bumped exactly once per history-compacting snapshot (Environment::compactHistory()),
+   * by the amount of history that snapshot discards. Zero until the first snapshot ever runs, so
+   * external_revision == revision for the lifetime of an Environment that is never compacted -
+   * every change gated on this design is behaviorally inert until compactHistory() first runs.
+   */
+  std::int64_t history_offset{ 0 };
+
+  /**
+   * @brief T-398 §7a: the smallest external_revision Environment::getChangesSince() will still
+   * answer; a request below this is refused rather than silently answered from a truncated history.
+   * @details Set to the external revision at the instant of a snapshot
+   * (floor_revision = history_offset_before + revision_before), not to history_offset alone - see
+   * the design doc §2.1 for why floor = offset under-refuses by the compact baseline's own size.
+   */
+  std::int64_t floor_revision{ 0 };
+
   /** @brief The history of commands applied to the environment after initialization */
   std::vector<std::shared_ptr<const Command>> commands;
 
@@ -437,6 +455,10 @@ std::unique_ptr<Environment::Implementation> Environment::Implementation::clone(
   cloned_env->initialized = initialized;
   cloned_env->init_revision = init_revision;
   cloned_env->revision = revision;
+  // T-398 §7a: a clone must preserve external-revision-numbering identity with its source - a
+  // consumer of the clone must see the same external revision the original would report.
+  cloned_env->history_offset = history_offset;
+  cloned_env->floor_revision = floor_revision;
   cloned_env->commands = commands;
   cloned_env->scene_graph = scene_graph->clone();
   cloned_env->timestamp = timestamp;
@@ -596,6 +618,11 @@ void Environment::Implementation::clear()
   initialized = false;
   revision = 0;
   init_revision = 0;
+  // T-398 §7a: a cleared/re-initialized environment starts a fresh command-history lineage and
+  // cannot justify any previously-discarded external-revision numbering from it - reset both.
+  // (This also covers initHelper()/reset(), both of which call clear() first.)
+  history_offset = 0;
+  floor_revision = 0;
   scene_graph = nullptr;
   state_solver = nullptr;
   current_state = tesseract::scene_graph::SceneState();
@@ -2374,6 +2401,13 @@ int Environment::getInitRevision() const
 {
   std::shared_lock<std::shared_mutex> lock(mutex_);
   return std::as_const<Implementation>(*impl_).init_revision;
+}
+
+std::int64_t Environment::getExternalRevision() const
+{
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const auto& impl = std::as_const<Implementation>(*impl_);
+  return impl.history_offset + static_cast<std::int64_t>(impl.revision);
 }
 
 std::vector<std::shared_ptr<const Command>> Environment::getCommandHistory() const

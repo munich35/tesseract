@@ -26,6 +26,7 @@
 
 #include <tesseract/common/macros.h>
 TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
+#include <cstdint>
 #include <functional>
 #include <vector>
 #include <string>
@@ -168,6 +169,17 @@ public:
    * @return Initialization revision number
    */
   int getInitRevision() const;
+
+  /**
+   * @brief Get the external (client-visible) revision number
+   * @details T-398 §7a: external_revision = history_offset + getRevision(). Equal to getRevision()
+   * until this Environment's history is first compacted (via a future compactHistory() call);
+   * monotonic across the whole object lifetime even though getRevision() itself can decrease when
+   * that happens. getRevision() itself is intentionally left meaning the internal (compact) value -
+   * existing callers of getRevision() must keep seeing that, unchanged.
+   * @return External revision number
+   */
+  std::int64_t getExternalRevision() const;
 
   /**
    * @brief Get Environment command history post initialization
