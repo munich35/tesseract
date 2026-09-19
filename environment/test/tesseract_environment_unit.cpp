@@ -3,6 +3,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <vector>
+#include <thread>
 #include <omp.h>
 #include <cmath>
 #include <fstream>
@@ -6006,6 +6007,112 @@ TEST(TesseractEnvironmentUnit, checkTrajectoryUnit)  // NOLINT
     // NOLINTNEXTLINE
     EXPECT_ANY_THROW(
         checkTrajectory(contacts, *continuous_manager, *joint_group, tesseract::common::TrajArray(), config));
+  }
+}
+
+// T-398 §7a exit gate (fable, 2026-09-19 16:4x, `tasks/T-398-...md` § "Phase 1 code review"): proves
+// compactHistory() at unit scale before Phase 2 starts.
+TEST(TesseractEnvironmentUnit, EnvCompactHistoryUnit)  // NOLINT
+{
+  auto env = getEnvironment();
+  EXPECT_EQ(env->getRevision(), 3);
+
+  // An event callback registered before compaction must survive it (carried forward at swap time,
+  // not silently dropped - §2.5's own explicit requirement).
+  int callback_counter{ 0 };
+  EventCallbackFn callback = [&callback_counter](const Event& /*event*/) { ++callback_counter; };
+  env->addEventCallback(0, callback);
+
+  // Grow the history with a representative mix of command types.
+  const std::string link_name = "link_1";
+  EXPECT_TRUE(env->applyCommand(std::make_shared<ChangeLinkCollisionEnabledCommand>(link_name, false)));
+
+  tesseract::common::AllowedCollisionMatrix remove_ac;
+  remove_ac.addAllowedCollision(link_name, "link_6", "unit test");
+  EXPECT_TRUE(env->applyCommand(
+      std::make_shared<ModifyAllowedCollisionsCommand>(remove_ac, ModifyAllowedCollisionsType::REMOVE)));
+
+  EXPECT_TRUE(env->applyCommand(std::make_shared<ChangeCollisionMarginsCommand>(0.025)));
+
+  env->setState(env->getStateSolver()->getRandomState().joints);
+
+  // Record state before compaction.
+  const std::int64_t external_revision_before = env->getExternalRevision();
+  const std::size_t history_length_before = env->getHistoryLength();
+  const tesseract::scene_graph::SceneState state_before = env->getState();
+  const bool link_1_collision_enabled_before = env->getSceneGraph()->getLinkCollisionEnabled(link_name);
+  tesseract::common::AllowedCollisionMatrix::ConstPtr acm_before = env->getAllowedCollisionMatrix();
+  const bool l1_l6_allowed_before = acm_before->isCollisionAllowed(link_name, "link_6");
+  const double default_margin_before = env->getCollisionMarginData().getDefaultCollisionMargin();
+
+  ASSERT_GT(history_length_before, 0U);
+
+  // Compact.
+  EXPECT_TRUE(env->compactHistory());
+
+  // External revision is unchanged by construction - history_offset absorbs exactly what was
+  // discarded (§2.1's core invariant).
+  EXPECT_EQ(env->getExternalRevision(), external_revision_before);
+  // Internal history is now small (the compact baseline, a handful of commands per §2.5).
+  EXPECT_LT(env->getHistoryLength(), history_length_before);
+  EXPECT_LE(env->getHistoryLength(), 10U);
+
+  // State equivalence across the swap - not just revision bookkeeping (this is exactly what fable's
+  // §2.5 blocking-defect fix exists to guarantee; a test that only checked revision numbers would
+  // not have caught that defect).
+  EXPECT_EQ(env->getSceneGraph()->getLinkCollisionEnabled(link_name), link_1_collision_enabled_before);
+  tesseract::common::AllowedCollisionMatrix::ConstPtr acm_after = env->getAllowedCollisionMatrix();
+  EXPECT_EQ(acm_after->isCollisionAllowed(link_name, "link_6"), l1_l6_allowed_before);
+  EXPECT_DOUBLE_EQ(env->getCollisionMarginData().getDefaultCollisionMargin(), default_margin_before);
+  const tesseract::scene_graph::SceneState state_after = env->getState();
+  for (const auto& j : state_before.joints)
+    EXPECT_NEAR(state_after.joints.at(j.first), j.second, 1e-9);
+
+  // The event callback survived the swap.
+  EXPECT_FALSE(env->getEventCallbacks().empty());
+
+  // getChangesSince at exactly the current external revision - the at-floor boundary case (§2.1):
+  // admitted with an empty diff, not refused. This is the case that fires on EVERY snapshot in
+  // production (a healthy, ticking client), not the far-behind refusal case below.
+  {
+    EnvironmentChanges changes = env->getChangesSince(external_revision_before);
+    EXPECT_TRUE(changes.success);
+    EXPECT_TRUE(changes.commands.empty());
+    EXPECT_EQ(changes.external_revision, external_revision_before);
+  }
+
+  // getChangesSince below the floor - refused (the new A3 fix), with the current external revision
+  // reported as the resync hint either way.
+  {
+    EnvironmentChanges changes = env->getChangesSince(external_revision_before - 1);
+    EXPECT_FALSE(changes.success);
+    EXPECT_EQ(changes.external_revision, external_revision_before);
+  }
+
+  // Swap-time CAS: a command applied to the live environment while a concurrent compaction is in
+  // flight must never be silently lost (fable's blocking-defect fix, §2.5 - the draft's original
+  // "transparently absorbed" claim was wrong). Races a second thread's compactHistory() against a
+  // sequence of commands applied from this thread - best-effort timing (there is no test-only
+  // injection point into compactHistory(), deliberately, so this is the only way to genuinely
+  // exercise the gap-reapply path rather than only reasoning about it), but the ASSERTION below is
+  // deterministic regardless of the actual interleaving: applyCommand() serializes all calls to the
+  // same Environment via its own internal locking, so whatever total order the 50 calls below
+  // actually land in, the LAST one to complete must be reflected in the final state - if the
+  // swap-time CAS silently dropped a gap command instead of re-applying it, this would observe a
+  // stale (non-final) value here instead.
+  {
+    std::thread compactor([&env]() { EXPECT_TRUE(env->compactHistory()); });
+
+    constexpr int kGapCommands = 50;
+    for (int i = 0; i < kGapCommands; ++i)
+      env->applyCommand(std::make_shared<ChangeLinkVisibilityCommand>(link_name, (i % 2) != 0));
+
+    compactor.join();
+
+    const bool expected_final_visibility = ((kGapCommands - 1) % 2) != 0;
+    EXPECT_EQ(env->getSceneGraph()->getLinkVisibility(link_name), expected_final_visibility);
+    EXPECT_TRUE(env->isInitialized());
+    EXPECT_GE(env->getExternalRevision(), external_revision_before);
   }
 }
 
