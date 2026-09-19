@@ -215,6 +215,27 @@ public:
   EnvironmentChanges getChangesSince(std::int64_t external_rev) const;
 
   /**
+   * @brief Compact this Environment's command history, bounding its unbounded growth (T-398 §7a §2.5/§2.5a)
+   * @details Builds a fresh, equivalent Environment from the current scene graph + kinematics info +
+   * contact-manager plugin info + allowed-collision matrix + collision margins + joint state
+   * (build-then-swap, never swap-then-verify - any failed build step discards the attempt and
+   * leaves this Environment completely untouched), then swaps it in under a single unique_lock. A
+   * swap-time CAS re-applies any commands that landed in the capture-to-swap gap before swapping
+   * (or aborts this attempt entirely if that re-apply itself fails); the swap also re-reads and
+   * re-applies the current joint state fresh, since setState() does not bump revision and so is
+   * invisible to the CAS above. getExternalRevision() is unaffected by a successful compaction -
+   * history_offset absorbs exactly the amount of history discarded, so external_revision only ever
+   * reads as continuous, never as a jump.
+   * @details Same builder for both the SERVER's own periodic trigger and each MONITORED CLIENT's
+   * own trigger against its own Environment object (§2.5a) - there is only one compaction
+   * mechanism, exposed as this one public entry point, not two.
+   * @return true if a compaction actually happened (built and swapped); false if this Environment
+   * is not initialized, or if any build/swap step failed (logged, this Environment is left exactly
+   * as it was, safe to retry on the next call)
+   */
+  bool compactHistory();
+
+  /**
    * @brief Applies the commands to the environment
    * @param commands Commands to be applied to the environment
    * @return true if successful. If returned false, then only a partial set of commands have been applied. Call
