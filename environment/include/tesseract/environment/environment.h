@@ -201,6 +201,14 @@ public:
   std::vector<std::shared_ptr<const Command>> getCommandHistory() const;
 
   /**
+   * @brief Get the internal command-history length, without copying the history itself
+   * @details T-398 §7a: a cheap size check for a compaction trigger predicate - getCommandHistory()
+   * copies the whole vector, which is wasteful for a per-tick "is it time to compact?" check.
+   * @return commands.size() - always equal to getRevision() for a well-formed Environment
+   */
+  std::size_t getHistoryLength() const;
+
+  /**
    * @brief Get the commands applied since a client-supplied external revision (T-398 §7a §2.3)
    * @details Single-lock read of history_offset/floor_revision/revision/commands as one consistent
    * group - the read this design's whole point is to make atomic, not a nested sequence of
