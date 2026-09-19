@@ -244,6 +244,18 @@ public:
   bool compactHistory();
 
   /**
+   * @brief Release the retired Implementation a prior compactHistory() call is still holding alive
+   * @details T-398 §7a (fable, 2026-09-19 17:0x): the depth-1 retirement queue exists to give an
+   * in-flight getName() caller a one-swap safety margin, but the retiree is the FULL prior
+   * generation (entire history + every part mesh it carried) - holding it until the NEXT
+   * compaction means the compaction that was supposed to free memory frees nothing for a whole
+   * trigger-threshold interval. Call this once, one tick after compactHistory() last returned
+   * true (one tick is a sufficient safety margin - no known caller holds a getName() reference
+   * across a publish period), not at the next compaction. A no-op if nothing is currently retired.
+   */
+  void releaseRetiredHistory();
+
+  /**
    * @brief Applies the commands to the environment
    * @param commands Commands to be applied to the environment
    * @return true if successful. If returned false, then only a partial set of commands have been applied. Call

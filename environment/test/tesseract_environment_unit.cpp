@@ -6071,6 +6071,20 @@ TEST(TesseractEnvironmentUnit, EnvCompactHistoryUnit)  // NOLINT
   // The event callback survived the swap.
   EXPECT_FALSE(env->getEventCallbacks().empty());
 
+  // releaseRetiredHistory() (fable, 2026-09-19 17:0x): the depth-1 retiree is the FULL prior
+  // generation - holding it until the next compaction means the compaction that was supposed to
+  // free memory frees nothing for a whole trigger-threshold interval. Releasing it explicitly here
+  // (as the monitor is meant to do one tick after a compaction, not at the next one) must be safe -
+  // the environment must keep behaving identically afterward, since nothing above depended on the
+  // retiree still being reachable.
+  env->releaseRetiredHistory();
+  EXPECT_EQ(env->getExternalRevision(), external_revision_before);
+  EXPECT_EQ(env->getSceneGraph()->getLinkCollisionEnabled(link_name), link_1_collision_enabled_before);
+  // A second, immediate release - the first call above already released the one retiree this
+  // compaction produced, so this call has nothing left to release. Must be a safe no-op, not just
+  // safe the first time.
+  env->releaseRetiredHistory();
+
   // getChangesSince at exactly the current external revision - the at-floor boundary case (§2.1):
   // admitted with an empty diff, not refused. This is the case that fires on EVERY snapshot in
   // production (a healthy, ticking client), not the far-behind refusal case below.
@@ -6113,6 +6127,13 @@ TEST(TesseractEnvironmentUnit, EnvCompactHistoryUnit)  // NOLINT
     EXPECT_EQ(env->getSceneGraph()->getLinkVisibility(link_name), expected_final_visibility);
     EXPECT_TRUE(env->isInitialized());
     EXPECT_GE(env->getExternalRevision(), external_revision_before);
+
+    // releaseRetiredHistory() after a SECOND compaction (the depth-1 queue has already been through
+    // one release-and-refill cycle above) - must still be safe and still leave the environment fully
+    // functional.
+    env->releaseRetiredHistory();
+    EXPECT_TRUE(env->isInitialized());
+    EXPECT_EQ(env->getSceneGraph()->getLinkVisibility(link_name), expected_final_visibility);
   }
 }
 

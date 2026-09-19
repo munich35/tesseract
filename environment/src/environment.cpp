@@ -2644,6 +2644,12 @@ bool Environment::compactHistory()
   return true;
 }
 
+void Environment::releaseRetiredHistory()
+{
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  impl_->retired_predecessor.reset();
+}
+
 bool Environment::applyCommands(const std::vector<std::shared_ptr<const Command>>& commands)
 {
   bool success{ false };
