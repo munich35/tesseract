@@ -2416,6 +2416,51 @@ std::vector<std::shared_ptr<const Command>> Environment::getCommandHistory() con
   return std::as_const<Implementation>(*impl_).commands;
 }
 
+EnvironmentChanges Environment::getChangesSince(std::int64_t external_rev) const
+{
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const auto& impl = std::as_const<Implementation>(*impl_);
+
+  // T-398 §7a §2.3: read offset/floor/revision/commands as one consistent group under one lock -
+  // this is the atomicity guarantee the whole method exists to provide, not a re-derivable
+  // property of calling several independently-locked getters in sequence.
+  const std::int64_t offset = impl.history_offset;
+  const std::int64_t floor = impl.floor_revision;
+  const std::int64_t current = offset + static_cast<std::int64_t>(impl.revision);
+
+  EnvironmentChanges result;
+  result.id = impl.scene_graph != nullptr ? impl.scene_graph->getName() : std::string();
+  result.external_revision = current;
+
+  if (external_rev > current)
+  {
+    // Impossible/stale-client case - unchanged from today's behavior, just now expressed in the
+    // external frame.
+    result.success = false;
+    return result;
+  }
+
+  if (external_rev < floor)
+  {
+    // T-398 §7a's own A3 fix: never silently answer from a truncated history.
+    CONSOLE_BRIDGE_logInform("Environment::getChangesSince: refused, requested revision %lld is below "
+                             "floor %lld (current external revision %lld, %lu commands in history)",
+                             static_cast<long long>(external_rev),   // NOLINT
+                             static_cast<long long>(floor),          // NOLINT
+                             static_cast<long long>(current),        // NOLINT
+                             static_cast<unsigned long>(impl.commands.size()));
+    result.success = false;
+    return result;
+  }
+
+  // Provably in [0, revision] here - never negative (external_rev >= floor >= offset) and never
+  // past the end (external_rev <= current, the check above).
+  const auto internal_req = static_cast<std::size_t>(external_rev - offset);
+  result.success = true;
+  result.commands.assign(impl.commands.begin() + static_cast<std::ptrdiff_t>(internal_req), impl.commands.end());
+  return result;
+}
+
 bool Environment::applyCommands(const std::vector<std::shared_ptr<const Command>>& commands)
 {
   bool success{ false };
