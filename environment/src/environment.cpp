@@ -2416,6 +2416,12 @@ std::vector<std::shared_ptr<const Command>> Environment::getCommandHistory() con
   return std::as_const<Implementation>(*impl_).commands;
 }
 
+std::size_t Environment::getHistoryLength() const
+{
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  return std::as_const<Implementation>(*impl_).commands.size();
+}
+
 EnvironmentChanges Environment::getChangesSince(std::int64_t external_rev) const
 {
   std::shared_lock<std::shared_mutex> lock(mutex_);
