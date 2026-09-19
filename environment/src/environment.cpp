@@ -174,6 +174,21 @@ struct Environment::Implementation
    */
   std::int64_t floor_revision{ 0 };
 
+  /**
+   * @brief T-398 §7a: depth-1 retirement queue for the Implementation a compaction swap replaces
+   * @details fable's review (Phase 1 code review, 2026-09-19 16:4x): getName() returns
+   * `const std::string&` into `impl_->scene_graph`'s own name string - a reference that dangles
+   * the instant a swap destroys the Implementation it pointed into. Immediately destroying the old
+   * Implementation at swap time (as the original single-line move-assignment did) gives a caller
+   * mid-way through a synchronous `getName()` use no safety margin at all. Keeping exactly one prior
+   * generation alive - released only at the NEXT swap, not the current one - is enough for the
+   * known synchronous same-call usage pattern (verified: no code in this tree stores a
+   * `getName()` reference across an await point) without adding a second lock or any public API
+   * change. The long-term fix is `getName()` returning by value (T-453); this is the bounded
+   * interim mitigation the design always promised, not a substitute for it.
+   */
+  std::unique_ptr<Implementation> retired_predecessor;
+
   /** @brief The history of commands applied to the environment after initialization */
   std::vector<std::shared_ptr<const Command>> commands;
 
@@ -2608,7 +2623,14 @@ bool Environment::compactHistory()
   compact->impl_->history_offset = old_public_revision - static_cast<std::int64_t>(compact->impl_->revision);
   compact->impl_->floor_revision = old_public_revision;
 
-  // The only line that touches the live object - one atomic move-assignment.
+  // T-398 §7a, fable's Phase 1 code-review gate item (2026-09-19 16:4x): retire the outgoing
+  // Implementation instead of destroying it immediately - depth-1 queue, so first release WHATEVER
+  // it is currently retiring itself (two generations back), then move it into the new
+  // Implementation's own retirement slot before the swap.
+  live.retired_predecessor.reset();
+  compact->impl_->retired_predecessor = std::move(impl_);
+
+  // The only remaining line that touches the live object slot - one atomic move-assignment.
   impl_ = std::move(compact->impl_);
 
   // [Open item, §6, deferred to a later pass, not this one: a distinct post-swap notification
