@@ -85,6 +85,19 @@ protected:
   friend void ::tesseract::environment::serialize(Archive& ar, EnvironmentContactAllowedValidator& obj);
 };
 
+/**
+ * @brief T-398 §7a: result of Environment::getChangesSince() - the commands applied since a
+ * client-supplied external revision, or a refusal with the current external revision as a resync
+ * hint if the client is too far ahead or too far behind (below the floor) to be answered.
+ */
+struct EnvironmentChanges
+{
+  bool success{ false };
+  std::int64_t external_revision{ 0 };
+  std::string id;
+  std::vector<std::shared_ptr<const Command>> commands;
+};
+
 class Environment
 {
 public:
@@ -186,6 +199,20 @@ public:
    * @return List of commands
    */
   std::vector<std::shared_ptr<const Command>> getCommandHistory() const;
+
+  /**
+   * @brief Get the commands applied since a client-supplied external revision (T-398 §7a §2.3)
+   * @details Single-lock read of history_offset/floor_revision/revision/commands as one consistent
+   * group - the read this design's whole point is to make atomic, not a nested sequence of
+   * independently-locked getter calls. Refuses (success=false) if external_rev is either ahead of
+   * the current external revision (an impossible/stale-client case, unchanged from today) or below
+   * floor_revision (the new A3 fix - never silently answers from a truncated history). A refusal's
+   * own external_revision field is always the current value, usable as a resync hint either way.
+   * @param external_rev The client's own last-known external revision
+   * @return success, the current external revision, this Environment's name, and (only on success)
+   * the commands applied since external_rev
+   */
+  EnvironmentChanges getChangesSince(std::int64_t external_rev) const;
 
   /**
    * @brief Applies the commands to the environment
