@@ -195,6 +195,18 @@ public:
   std::int64_t getExternalRevision() const;
 
   /**
+   * @brief Set this Environment's external-revision offset (T-398 §7a §2.7, client bookkeeping)
+   * @details For a monitored CLIENT's own Environment object, after a full re-fetch + init(commands)
+   * succeeds: call setRevisionOffset(server_external_revision - getRevision()) so this object's own
+   * getExternalRevision() then reports the same number the server does. Bookkeeping then advances
+   * automatically on every subsequent applyCommands()/processMsg() call, since getRevision() itself
+   * already does - no further bookkeeping needed at each call site. Not used by a server-side
+   * Environment - its own offset only ever changes via compactHistory()'s internal swap logic.
+   * @param offset The offset such that external_revision = offset + getRevision() going forward
+   */
+  void setRevisionOffset(std::int64_t offset);
+
+  /**
    * @brief Get Environment command history post initialization
    * @return List of commands
    */
