@@ -2399,6 +2399,7 @@ bool Environment::applyCommand(std::shared_ptr<const Command> command) { return 
 
 std::shared_ptr<const tesseract::scene_graph::SceneGraph> Environment::getSceneGraph() const
 {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
   return std::as_const<Implementation>(*impl_).scene_graph;
 }
 
