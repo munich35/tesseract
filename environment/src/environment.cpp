@@ -2443,6 +2443,18 @@ std::vector<std::shared_ptr<const Command>> Environment::getCommandHistory() con
   return std::as_const<Implementation>(*impl_).commands;
 }
 
+std::pair<std::vector<std::shared_ptr<const Command>>, std::int64_t>
+Environment::getCommandHistoryAndExternalRevision() const
+{
+  // T-398 §7a, fable's root-cause fix 2026-09-20: ONE lock for both reads - see this method's own
+  // header docstring for the TOCTOU gap this closes (two separately-locked reads let a concurrent
+  // applyCommands() land in between under live traffic).
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  const auto& impl = std::as_const<Implementation>(*impl_);
+  const std::int64_t external_revision = impl.history_offset + static_cast<std::int64_t>(impl.revision);
+  return { impl.commands, external_revision };
+}
+
 std::size_t Environment::getHistoryLength() const
 {
   std::shared_lock<std::shared_mutex> lock(mutex_);
