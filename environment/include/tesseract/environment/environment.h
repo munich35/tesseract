@@ -32,6 +32,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <string>
 #include <chrono>
 #include <set>
+#include <utility>
 #include <memory>
 #include <shared_mutex>
 #include <Eigen/Geometry>
@@ -219,6 +220,23 @@ public:
    * @return commands.size() - always equal to getRevision() for a well-formed Environment
    */
   std::size_t getHistoryLength() const;
+
+  /**
+   * @brief Get the command history and external revision as ONE atomic snapshot (T-398 §7a,
+   * fable's root-cause fix 2026-09-20)
+   * @details getCommandHistory() and getExternalRevision() each take their OWN brief shared_lock -
+   * calling them separately (as GetEnvironmentInformation's handler originally did) leaves a gap
+   * where a concurrent applyCommands() can land between the two reads. Under live traffic this
+   * means the returned history can be k commands FRESHER than the revision number describing it -
+   * offset math built from that pair understates by k, and the resulting client mirror's own
+   * external revision drifts ahead of the server's, tripping the < branch's reset() (which zeroes
+   * the offset) on the very next message and producing a below-floor refusal -> reinit -> repeat
+   * loop under continued traffic (measured live: 13, then 8, iterations before this fix - the
+   * queued-stale-message fix alone brought 13 down to 8, this closes the remaining gap). Same
+   * grouped-read discipline getChangesSince() already uses for its own offset/floor/revision read.
+   * @return {command history, external revision} as of the same single lock acquisition
+   */
+  std::pair<std::vector<std::shared_ptr<const Command>>, std::int64_t> getCommandHistoryAndExternalRevision() const;
 
   /**
    * @brief Get the commands applied since a client-supplied external revision (T-398 §7a §2.3)

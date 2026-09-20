@@ -4,6 +4,7 @@ TESSERACT_COMMON_IGNORE_WARNINGS_PUSH
 #include <algorithm>
 #include <vector>
 #include <thread>
+#include <atomic>
 #include <omp.h>
 #include <cmath>
 #include <fstream>
@@ -6135,6 +6136,45 @@ TEST(TesseractEnvironmentUnit, EnvCompactHistoryUnit)  // NOLINT
     EXPECT_TRUE(env->isInitialized());
     EXPECT_EQ(env->getSceneGraph()->getLinkVisibility(link_name), expected_final_visibility);
   }
+}
+
+TEST(TesseractEnvironmentUnit, EnvGetCommandHistoryAndExternalRevisionAtomicUnit)  // NOLINT
+{
+  // T-398 §7a, fable's root-cause fix 2026-09-20: getCommandHistoryAndExternalRevision() must
+  // return a history and a revision from the SAME instant, never a torn pair where one describes
+  // an earlier state than the other. With no compaction in this test, history_offset stays 0, so
+  // the invariant simplifies to external_revision == history.size() on every single sample -
+  // exactly the property the old two-separately-locked-calls approach (getExternalRevision() then
+  // getCommandHistory()) could violate under concurrent applyCommand() traffic (see this method's
+  // own header docstring for the below-floor-refusal loop that gap produced live).
+  auto env = getEnvironment();
+  const std::int64_t revision_before = env->getRevision();
+
+  std::atomic<bool> stop{ false };
+  std::atomic<int> mismatches{ 0 };
+  std::atomic<int> samples{ 0 };
+
+  std::thread sampler([&]() {
+    while (!stop)
+    {
+      auto [history, external_revision] = env->getCommandHistoryAndExternalRevision();
+      ++samples;
+      if (external_revision != static_cast<std::int64_t>(history.size()))
+        ++mismatches;
+    }
+  });
+
+  const std::string link_name = "link_1";
+  constexpr int kHammerCommands = 2000;
+  for (int i = 0; i < kHammerCommands; ++i)
+    EXPECT_TRUE(env->applyCommand(std::make_shared<ChangeLinkVisibilityCommand>(link_name, (i % 2) != 0)));
+
+  stop = true;
+  sampler.join();
+
+  EXPECT_GT(samples.load(), 0);
+  EXPECT_EQ(mismatches.load(), 0);
+  EXPECT_EQ(env->getRevision(), revision_before + kHammerCommands);
 }
 
 int main(int argc, char** argv)
