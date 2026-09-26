@@ -254,24 +254,44 @@ public:
 
   /**
    * @brief Compact this Environment's command history, bounding its unbounded growth (T-398 §7a §2.5/§2.5a)
-   * @details Builds a fresh, equivalent Environment from the current scene graph + kinematics info +
-   * contact-manager plugin info + allowed-collision matrix + collision margins + joint state
-   * (build-then-swap, never swap-then-verify - any failed build step discards the attempt and
-   * leaves this Environment completely untouched), then swaps it in under a single unique_lock. A
-   * swap-time CAS re-applies any commands that landed in the capture-to-swap gap before swapping
-   * (or aborts this attempt entirely if that re-apply itself fails); the swap also re-reads and
-   * re-applies the current joint state fresh, since setState() does not bump revision and so is
-   * invisible to the CAS above. getExternalRevision() is unaffected by a successful compaction -
-   * history_offset absorbs exactly the amount of history discarded, so external_revision only ever
-   * reads as continuous, never as a jump.
+   * @details Builds a fresh, equivalent Environment by replaying commands[0, keep_from) - the
+   * portion of history OLDER than the retained tail - into a temporary Environment, then building
+   * the compact baseline (scene graph clone + kinematics info + contact-manager plugin info +
+   * allowed-collision matrix + collision margins + joint state) from THAT replayed state, then
+   * re-applying the retained tail commands[keep_from, revision) on top as their own original,
+   * lightweight command objects (build-then-swap, never swap-then-verify - any failed build step
+   * discards the attempt and leaves this Environment completely untouched), then swaps it in under
+   * a single unique_lock. A swap-time CAS re-applies any commands that landed in the
+   * capture-to-swap gap before swapping (or aborts this attempt entirely if that re-apply itself
+   * fails); the swap also re-reads and re-applies the current joint state fresh, since setState()
+   * does not bump revision and so is invisible to the CAS above. getExternalRevision() is
+   * unaffected by a successful compaction - history_offset absorbs exactly the amount of history
+   * discarded, so external_revision only ever reads as continuous, never as a jump.
+   * @details T-489 retention (fable's design, 2026-09-27): floor_revision is set to
+   * history_offset + baseline_len, NOT the current external revision - a client whose last-known
+   * external revision falls anywhere within the retained tail gets served real delta commands via
+   * getChangesSince() instead of being refused into a full baseline refetch. This is what bounds
+   * both the per-call refetch cost (which otherwise grows with every part ever placed, since the
+   * old always-refuse-below-current floor forced a full baseline fetch for any client that was
+   * even one poll interval behind) and the resulting permanent per-compaction memory step in every
+   * fetcher. keep_from itself is clamped to never fall before the CURRENT baseline's own boundary
+   * (floor_revision - history_offset, the previous compaction's own baseline_len) - replaying into
+   * the middle of a still-live baseline's own commands would rebuild an incomplete/incorrect
+   * intermediate environment.
    * @details Same builder for both the SERVER's own periodic trigger and each MONITORED CLIENT's
    * own trigger against its own Environment object (§2.5a) - there is only one compaction
    * mechanism, exposed as this one public entry point, not two.
+   * @param retain_tail how many of the most recent commands to keep uncompacted (as their
+   * original, lightweight objects) rather than folding into the baseline. Should be at least
+   * ~2x the expected client poll interval expressed in revisions, so a normally-paced client never
+   * falls below the new floor. Default 64 keeps the one existing call site (ROSEnvironmentMonitor's
+   * periodic trigger) compiling unchanged; make it configurable there (a ROS param), not here.
    * @return true if a compaction actually happened (built and swapped); false if this Environment
-   * is not initialized, or if any build/swap step failed (logged, this Environment is left exactly
+   * is not initialized, if the entire history is already within the retention window (nothing old
+   * enough to compact), or if any build/swap step failed (logged, this Environment is left exactly
    * as it was, safe to retry on the next call)
    */
-  bool compactHistory();
+  bool compactHistory(std::size_t retain_tail = 64);
 
   /**
    * @brief Release the retired Implementation a prior compactHistory() call is still holding alive
