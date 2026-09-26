@@ -2519,6 +2519,7 @@ bool Environment::compactHistory(std::size_t retain_tail)
   std::shared_ptr<const tesseract::common::ResourceLocator> resource_locator;
   std::string captured_name;
   std::int64_t captured_revision{ 0 };
+  std::int64_t current_baseline_len{ 0 };
   std::size_t keep_from{ 0 };
 
   {
@@ -2538,16 +2539,22 @@ bool Environment::compactHistory(std::size_t retain_tail)
     // function itself establishes one compaction earlier (see the matching floor_revision
     // assignment in Step 3 below). Without this clamp, a second compaction closer than
     // retain_tail revisions to the first would replay a partial baseline, corrupting it.
-    const auto current_baseline_len = impl.floor_revision - impl.history_offset;
+    current_baseline_len = impl.floor_revision - impl.history_offset;
     const auto retain_lower_bound =
         static_cast<std::int64_t>(history_snapshot.size()) - static_cast<std::int64_t>(retain_tail);
     const auto keep_from_signed = std::max<std::int64_t>(current_baseline_len, std::max<std::int64_t>(retain_lower_bound, 0));
     keep_from = static_cast<std::size_t>(keep_from_signed);
   }
 
-  if (keep_from >= history_snapshot.size())
+  // Nothing NEW to compact: keep_from never fell past the existing baseline's own boundary, which
+  // means every command beyond it is already going to be retained as tail either way (either the
+  // whole remaining history fits inside retain_tail, or this compaction fired again before
+  // retain_tail new commands had even accumulated). Compacting here would rebuild the identical
+  // baseline for no benefit - NOT "keep_from >= history_snapshot.size()", which would incorrectly
+  // reject a legitimate full collapse (retain_tail=0, or a history shorter than retain_tail on the
+  // very first-ever compaction with nothing yet retained).
+  if (keep_from <= current_baseline_len)
   {
-    // The whole history is already within the retention window - nothing old enough to compact.
     return false;
   }
 
@@ -2557,28 +2564,39 @@ bool Environment::compactHistory(std::size_t retain_tail)
   // init(commands) pattern interface_external_revision_unit.cpp's fetchLikeInterface() already
   // proves 3/3 green, not a new mechanism - then build the baseline from THAT replayed state,
   // never from the live/current one. ----
-  Environment tempEnv;
-  Commands older(history_snapshot.begin(), history_snapshot.begin() + static_cast<std::ptrdiff_t>(keep_from));
-  if (!tempEnv.init(older))
-  {
-    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: replay of the pre-retention prefix (%zu commands) failed, "
-                           "aborting",
-                           older.size());
-    return false;
-  }
+  std::unique_ptr<tesseract::scene_graph::SceneGraph> scene_graph_clone;
+  tesseract::srdf::KinematicsInformation kinematics_information;
+  tesseract::common::ContactManagersPluginInfo contact_managers_plugin_info;
+  std::shared_ptr<const tesseract::common::AllowedCollisionMatrix> allowed_collision_matrix;
+  tesseract::common::CollisionMarginData collision_margin_data;
+  tesseract::scene_graph::SceneState captured_state;
 
-  auto scene_graph_clone = tempEnv.getSceneGraph()->clone();
-  if (scene_graph_clone == nullptr)
   {
-    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: scene graph clone (post-replay) failed, aborting");
-    return false;
-  }
-  tesseract::srdf::KinematicsInformation kinematics_information = tempEnv.getKinematicsInformation();
-  tesseract::common::ContactManagersPluginInfo contact_managers_plugin_info = tempEnv.getContactManagersPluginInfo();
-  std::shared_ptr<const tesseract::common::AllowedCollisionMatrix> allowed_collision_matrix =
-      tempEnv.getAllowedCollisionMatrix();
-  tesseract::common::CollisionMarginData collision_margin_data = tempEnv.getCollisionMarginData();
-  tesseract::scene_graph::SceneState captured_state = tempEnv.getState();
+    // fable's binding condition (3), 2026-09-27: tempEnv scoped to exactly this block so it is
+    // destroyed the instant we've extracted what we need from it - bounds the transient memory
+    // peak (live env + tempEnv + compact would otherwise coexist for the rest of this function).
+    Environment tempEnv;
+    Commands older(history_snapshot.begin(), history_snapshot.begin() + static_cast<std::ptrdiff_t>(keep_from));
+    if (!tempEnv.init(older))
+    {
+      CONSOLE_BRIDGE_logWarn("Environment::compactHistory: replay of the pre-retention prefix (%zu commands) "
+                             "failed, aborting",
+                             older.size());
+      return false;
+    }
+
+    scene_graph_clone = tempEnv.getSceneGraph()->clone();
+    if (scene_graph_clone == nullptr)
+    {
+      CONSOLE_BRIDGE_logWarn("Environment::compactHistory: scene graph clone (post-replay) failed, aborting");
+      return false;
+    }
+    kinematics_information = tempEnv.getKinematicsInformation();
+    contact_managers_plugin_info = tempEnv.getContactManagersPluginInfo();
+    allowed_collision_matrix = tempEnv.getAllowedCollisionMatrix();
+    collision_margin_data = tempEnv.getCollisionMarginData();
+    captured_state = tempEnv.getState();
+  }  // tempEnv destroyed here
 
   auto compact = std::make_unique<Environment>();
 

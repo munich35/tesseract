@@ -6048,8 +6048,12 @@ TEST(TesseractEnvironmentUnit, EnvCompactHistoryUnit)  // NOLINT
 
   ASSERT_GT(history_length_before, 0U);
 
-  // Compact.
-  EXPECT_TRUE(env->compactHistory());
+  // Compact. retain_tail=0: this test's own history is far smaller than the new default (64), and
+  // its intent (baseline-swap state equivalence, event-callback carry-forward, retiree release) is
+  // orthogonal to T-489 retention specifically - 0 preserves the original full-collapse behavior
+  // this test was written against. Retention itself is covered by its own dedicated test(s) in
+  // tesseract_ros2's interface_external_revision_unit.cpp.
+  EXPECT_TRUE(env->compactHistory(0));
 
   // External revision is unchanged by construction - history_offset absorbs exactly what was
   // discarded (§2.1's core invariant).
@@ -6116,7 +6120,7 @@ TEST(TesseractEnvironmentUnit, EnvCompactHistoryUnit)  // NOLINT
   // swap-time CAS silently dropped a gap command instead of re-applying it, this would observe a
   // stale (non-final) value here instead.
   {
-    std::thread compactor([&env]() { EXPECT_TRUE(env->compactHistory()); });
+    std::thread compactor([&env]() { EXPECT_TRUE(env->compactHistory(0)); });  // retain_tail=0, see above
 
     constexpr int kGapCommands = 50;
     for (int i = 0; i < kGapCommands; ++i)
