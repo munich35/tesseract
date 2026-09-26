@@ -22,6 +22,8 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+
 #include <tesseract/environment/environment.h>
 #include <tesseract/environment/utils.h>
 #include <tesseract/environment/events.h>
@@ -2506,18 +2508,18 @@ EnvironmentChanges Environment::getChangesSince(std::int64_t external_rev) const
   return result;
 }
 
-bool Environment::compactHistory()
+bool Environment::compactHistory(std::size_t retain_tail)
 {
-  // ---- Step 1: capture inputs under one fresh shared_lock (T-398 §7a §2.5) ----
-  std::unique_ptr<tesseract::scene_graph::SceneGraph> scene_graph_clone;
-  tesseract::srdf::KinematicsInformation kinematics_information;
-  tesseract::common::ContactManagersPluginInfo contact_managers_plugin_info;
-  std::shared_ptr<const tesseract::common::AllowedCollisionMatrix> allowed_collision_matrix;
-  tesseract::common::CollisionMarginData collision_margin_data;
-  tesseract::scene_graph::SceneState captured_state;
+  // ---- Step 1: capture inputs under one fresh shared_lock (T-398 §7a §2.5; T-489 retention,
+  // fable's design 2026-09-27, tools2 build: capture the commands vector itself too, so Step 2 can
+  // replay the pre-retention PREFIX instead of cloning the live/current scene graph - cloning the
+  // live graph would already bake in the tail commands we are about to keep uncompacted, defeating
+  // the whole point of retention.) ----
+  Commands history_snapshot;
   std::shared_ptr<const tesseract::common::ResourceLocator> resource_locator;
   std::string captured_name;
   std::int64_t captured_revision{ 0 };
+  std::size_t keep_from{ 0 };
 
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -2526,26 +2528,58 @@ bool Environment::compactHistory()
     if (!impl.initialized)
       return false;
 
-    scene_graph_clone = impl.scene_graph->clone();
-    kinematics_information = impl.kinematics_information;
-    contact_managers_plugin_info = impl.contact_managers_plugin_info;
-    allowed_collision_matrix = impl.scene_graph->getAllowedCollisionMatrix();
-    collision_margin_data = impl.collision_margin_data;
-    captured_state = impl.current_state;
+    history_snapshot = impl.commands;  // shared_ptr copies - cheap, no deep command copy
     resource_locator = impl.resource_locator;
     captured_name = impl.scene_graph->getName();
     captured_revision = static_cast<std::int64_t>(impl.revision);
+
+    // T-489 retention clamp: never replay INTO the CURRENT baseline's own commands.
+    // floor_revision - history_offset is exactly that baseline's length - the same invariant this
+    // function itself establishes one compaction earlier (see the matching floor_revision
+    // assignment in Step 3 below). Without this clamp, a second compaction closer than
+    // retain_tail revisions to the first would replay a partial baseline, corrupting it.
+    const auto current_baseline_len = impl.floor_revision - impl.history_offset;
+    const auto retain_lower_bound =
+        static_cast<std::int64_t>(history_snapshot.size()) - static_cast<std::int64_t>(retain_tail);
+    const auto keep_from_signed = std::max<std::int64_t>(current_baseline_len, std::max<std::int64_t>(retain_lower_bound, 0));
+    keep_from = static_cast<std::size_t>(keep_from_signed);
   }
 
-  if (scene_graph_clone == nullptr)
+  if (keep_from >= history_snapshot.size())
   {
-    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: scene graph clone failed, aborting");
+    // The whole history is already within the retention window - nothing old enough to compact.
     return false;
   }
 
-  // ---- Step 2: build compact entirely unlocked on the live object - build-then-swap, never
-  // swap-then-verify. Any failed step below discards this attempt and leaves the live environment
-  // completely untouched. ----
+  // ---- Step 2: build compact entirely unlocked - build-then-swap, never swap-then-verify. Any
+  // failed step below discards this attempt and leaves the live environment completely untouched.
+  // T-489 retention: replay ONLY commands[0, keep_from) into a temporary Environment - the same
+  // init(commands) pattern interface_external_revision_unit.cpp's fetchLikeInterface() already
+  // proves 3/3 green, not a new mechanism - then build the baseline from THAT replayed state,
+  // never from the live/current one. ----
+  Environment tempEnv;
+  Commands older(history_snapshot.begin(), history_snapshot.begin() + static_cast<std::ptrdiff_t>(keep_from));
+  if (!tempEnv.init(older))
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: replay of the pre-retention prefix (%zu commands) failed, "
+                           "aborting",
+                           older.size());
+    return false;
+  }
+
+  auto scene_graph_clone = tempEnv.getSceneGraph()->clone();
+  if (scene_graph_clone == nullptr)
+  {
+    CONSOLE_BRIDGE_logWarn("Environment::compactHistory: scene graph clone (post-replay) failed, aborting");
+    return false;
+  }
+  tesseract::srdf::KinematicsInformation kinematics_information = tempEnv.getKinematicsInformation();
+  tesseract::common::ContactManagersPluginInfo contact_managers_plugin_info = tempEnv.getContactManagersPluginInfo();
+  std::shared_ptr<const tesseract::common::AllowedCollisionMatrix> allowed_collision_matrix =
+      tempEnv.getAllowedCollisionMatrix();
+  tesseract::common::CollisionMarginData collision_margin_data = tempEnv.getCollisionMarginData();
+  tesseract::scene_graph::SceneState captured_state = tempEnv.getState();
+
   auto compact = std::make_unique<Environment>();
 
   if (!compact->init(*scene_graph_clone, nullptr))
@@ -2608,6 +2642,25 @@ bool Environment::compactHistory()
     return false;
   }
 
+  // T-489 retention: record the pure baseline's length BEFORE applying the retained tail - this is
+  // what floor_revision is set from at the swap below (floor = offset + baseline_len), not the
+  // combined baseline+tail revision. Fixed here so a later gap re-apply (Step 3, races landing
+  // between capture and swap) can never move it.
+  const auto baseline_len = static_cast<std::int64_t>(compact->getRevision());
+
+  if (keep_from < history_snapshot.size())
+  {
+    Commands tail(history_snapshot.begin() + static_cast<std::ptrdiff_t>(keep_from),
+                  history_snapshot.begin() + static_cast<std::ptrdiff_t>(captured_revision));
+    if (!tail.empty() && !compact->applyCommands(tail))
+    {
+      CONSOLE_BRIDGE_logWarn("Environment::compactHistory: re-applying the retained tail (%zu commands) failed, "
+                             "aborting",
+                             tail.size());
+      return false;
+    }
+  }
+
   // ---- Step 3: swap under one unique_lock - the ONLY code that touches the live object. ----
   std::unique_lock<std::shared_mutex> lock(mutex_);
   Implementation& live = *impl_;
@@ -2641,11 +2694,19 @@ bool Environment::compactHistory()
   compact->impl_->event_cb = live.event_cb;
   compact->impl_->find_tcp_cb = live.find_tcp_cb;
 
-  // T-398 §7a §2.1: floor = the external revision AT THE INSTANT OF THIS SWAP, not history_offset
-  // alone - under-refusing by the compact baseline's own size reproduces the exact silent-tail
-  // hazard the floor exists to close (§2.1's own correction to the draft's floor = offset).
+  // history_offset still aligns the EXTERNAL frame to old_public_revision exactly as before
+  // (T-398 §7a §2.1) - external_revision = offset + internal_revision must equal old_public_revision
+  // regardless of how many internal commands (baseline + retained tail + any swap-time gap
+  // commands) now make up that internal revision.
+  //
+  // T-489 retention (fable's design 2026-09-27): floor_revision is now offset + baseline_len, NOT
+  // old_public_revision - a client whose external revision falls anywhere in [floor, old_public_
+  // revision] is within the retained tail and gets served real commands via getChangesSince(),
+  // not refused into a full baseline refetch. Only a client older than the retention window (below
+  // the baseline boundary) still needs the full baseline - the case the floor existed to guard in
+  // the first place (§2.1's silent-tail hazard), unchanged.
   compact->impl_->history_offset = old_public_revision - static_cast<std::int64_t>(compact->impl_->revision);
-  compact->impl_->floor_revision = old_public_revision;
+  compact->impl_->floor_revision = compact->impl_->history_offset + baseline_len;
 
   // T-398 §7a, fable's Phase 1 code-review gate item (2026-09-19 16:4x): retire the outgoing
   // Implementation instead of destroying it immediately - depth-1 queue, so first release WHATEVER
