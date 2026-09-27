@@ -6142,6 +6142,54 @@ TEST(TesseractEnvironmentUnit, EnvCompactHistoryUnit)  // NOLINT
   }
 }
 
+TEST(TesseractEnvironmentUnit, EnvCompactHistoryClientOffsetUnit)  // NOLINT
+{
+  // T-489 bugfix (fable's review, 2026-09-27, found by the client-compaction gtest, T-489 fork
+  // item 3): a CLIENT-side Environment gets its external-revision bookkeeping from
+  // setRevisionOffset() alone (see ROSEnvironmentMonitorInterface::getEnvironment()) and never
+  // compacts itself first, so floor_revision stays 0 while history_offset is whatever the server
+  // reported - current_baseline_len (floor_revision - history_offset) goes NEGATIVE, unlike the
+  // server's own usage where floor_revision and history_offset always advance together and the
+  // difference is a real (non-negative) baseline length. The old code compared this raw, possibly
+  // negative std::int64_t against a std::size_t ("keep_from <= current_baseline_len"): the
+  // signed->unsigned conversion turned any negative value into a huge one, so the guard fired on
+  // EVERY call and compactHistory() silently refused to ever compact a client-offset Environment.
+  auto env = getEnvironment();
+  const std::int64_t offset = 1000;
+  env->setRevisionOffset(offset);
+  EXPECT_EQ(env->getExternalRevision(), offset + env->getRevision());
+
+  // The exact broken precondition: floor_revision (0, never compacted) < history_offset (the
+  // client offset just set above).
+  ASSERT_GT(offset, 0);
+
+  // Grow past a handful of commands so there is something to compact.
+  const std::string link_name = "link_1";
+  EXPECT_TRUE(env->applyCommand(std::make_shared<ChangeLinkCollisionEnabledCommand>(link_name, false)));
+  EXPECT_TRUE(env->applyCommand(std::make_shared<ChangeCollisionMarginsCommand>(0.03)));
+
+  // Captured immediately before compaction, AFTER the growth above - this is the revision the
+  // compaction itself must preserve, not the pre-growth one (applying commands legitimately
+  // advances the revision; that is not what this test is checking).
+  const std::int64_t external_revision_before = env->getExternalRevision();
+
+  // Before the fix this returned false unconditionally, regardless of retain_tail or history size.
+  EXPECT_TRUE(env->compactHistory(0));
+
+  // The core invariant this whole mechanism exists to guarantee: external revision is CONTINUOUS
+  // across a compaction, client-offset or not.
+  EXPECT_EQ(env->getExternalRevision(), external_revision_before);
+
+  // A subsequent delta against the (unchanged) external revision must succeed - this is the
+  // production consequence of the bug: a client stuck unable to compact would eventually be asked
+  // for changes since a revision the server has already discarded (below its own floor), forcing
+  // exactly the full-refetch churn T-489 retention was built to eliminate.
+  EnvironmentChanges changes = env->getChangesSince(external_revision_before);
+  EXPECT_TRUE(changes.success);
+  EXPECT_TRUE(changes.commands.empty());
+  EXPECT_EQ(changes.external_revision, external_revision_before);
+}
+
 TEST(TesseractEnvironmentUnit, EnvGetCommandHistoryAndExternalRevisionAtomicUnit)  // NOLINT
 {
   // T-398 §7a, fable's root-cause fix 2026-09-20: getCommandHistoryAndExternalRevision() must
