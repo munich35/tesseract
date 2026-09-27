@@ -2539,7 +2539,15 @@ bool Environment::compactHistory(std::size_t retain_tail)
     // function itself establishes one compaction earlier (see the matching floor_revision
     // assignment in Step 3 below). Without this clamp, a second compaction closer than
     // retain_tail revisions to the first would replay a partial baseline, corrupting it.
-    current_baseline_len = impl.floor_revision - impl.history_offset;
+    // T-489 bugfix (fable's review, 2026-09-27): a client-side Environment that only ever got its
+    // offset via setRevisionOffset() (never compacted itself) has floor_revision == 0 while
+    // history_offset > 0 - the subtraction goes negative even though a baseline length is never
+    // negative. Clamp here, at the single source, so every later use of current_baseline_len is
+    // safe - the standalone "keep_from <= current_baseline_len" check below independently mixed
+    // a size_t against this raw (possibly negative) value, converting signed->unsigned and always
+    // firing, which silently refused every client-side compaction (found by the client-compaction
+    // gtest, T-489 fork item 3).
+    current_baseline_len = std::max<std::int64_t>(0, impl.floor_revision - impl.history_offset);
     const auto retain_lower_bound =
         static_cast<std::int64_t>(history_snapshot.size()) - static_cast<std::int64_t>(retain_tail);
     const auto keep_from_signed = std::max<std::int64_t>(current_baseline_len, std::max<std::int64_t>(retain_lower_bound, 0));
@@ -2553,7 +2561,7 @@ bool Environment::compactHistory(std::size_t retain_tail)
   // baseline for no benefit - NOT "keep_from >= history_snapshot.size()", which would incorrectly
   // reject a legitimate full collapse (retain_tail=0, or a history shorter than retain_tail on the
   // very first-ever compaction with nothing yet retained).
-  if (keep_from <= current_baseline_len)
+  if (static_cast<std::int64_t>(keep_from) <= current_baseline_len)
   {
     return false;
   }
