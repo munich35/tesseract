@@ -73,7 +73,7 @@ target_compile_definitions(urdf PUBLIC ${TESSERACT_COMPILE_DEFINITIONS})
 # linking them; point-cloud parsing does not need host-specific SIMD codegen.
 # (probe-verified: each pcl_* target's INTERFACE_COMPILE_OPTIONS contains ONLY the arch genex
 #  "$<$<COMPILE_LANGUAGE:CXX>:-msse4.2;-mfpmath=sse;-march=native;-mavx2>" -> safe to wipe whole.)
-foreach(_pcl_tgt pcl_common pcl_io pcl_io_ply pcl_octree)
+foreach(_pcl_tgt pcl_common pcl_io pcl_octree)
   if(TARGET ${_pcl_tgt})
     set_target_properties(${_pcl_tgt} PROPERTIES INTERFACE_COMPILE_OPTIONS "")
   endif()
