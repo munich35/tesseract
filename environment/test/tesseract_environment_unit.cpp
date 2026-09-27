@@ -6190,6 +6190,104 @@ TEST(TesseractEnvironmentUnit, EnvCompactHistoryClientOffsetUnit)  // NOLINT
   EXPECT_EQ(changes.external_revision, external_revision_before);
 }
 
+TEST(TesseractEnvironmentUnit, EnvCompactHistoryRemoveOnlyTailFullCollapseUnit)  // NOLINT
+{
+  // T-489 (e) fix (fable's design, 2026-09-27): a tail that retention would otherwise KEEP consists
+  // entirely of REMOVE_LINK commands - retaining it would hold the pre-removal baseline (with the
+  // removed links' geometry still shared-referenced via SceneGraph::clone(), which shares mesh data
+  // rather than duplicating it) alive for no delta-serving benefit, since a client landing below the
+  // new floor gets a full refetch of the NEW, already-small baseline either way. compactHistory()
+  // must detect an all-REMOVE tail and fully collapse instead of retaining it.
+  auto env = getEnvironment();
+  const std::size_t n_links = 70;
+  std::vector<std::string> link_names;
+  for (std::size_t i = 0; i < n_links; ++i)
+  {
+    const std::string name = "t489e_link_" + std::to_string(i);
+    link_names.push_back(name);
+    EXPECT_TRUE(env->applyCommand(std::make_shared<AddLinkCommand>(Link(name))));
+  }
+  for (const auto& name : link_names)
+    EXPECT_TRUE(env->applyCommand(std::make_shared<RemoveLinkCommand>(name)));
+
+  const std::int64_t external_revision_before = env->getExternalRevision();
+  const std::size_t retain_tail = 64;
+  // 70 adds + 70 removes + the fixture's own init commands is comfortably more than retain_tail, so
+  // the LAST 64 commands (the tail retention would normally keep) land entirely inside the 70
+  // removes above - exactly fable's worked example (70 adds, 64 of the 70 removes as the tail).
+  ASSERT_GT(env->getHistoryLength(), retain_tail);
+
+  EXPECT_TRUE(env->compactHistory(retain_tail));
+
+  // Full collapse, not retention: none of the removed links' geometry survives in the baseline.
+  for (const auto& name : link_names)
+    EXPECT_TRUE(env->getSceneGraph()->getLink(name) == nullptr);
+  EXPECT_EQ(env->getExternalRevision(), external_revision_before);
+
+  // Floor == external revision (full collapse invariant): a client one revision behind is refused,
+  // not served a retained delta the way a genuine retention window would.
+  EnvironmentChanges changes = env->getChangesSince(external_revision_before - 1);
+  EXPECT_FALSE(changes.success);
+  EXPECT_EQ(changes.external_revision, external_revision_before);
+}
+
+TEST(TesseractEnvironmentUnit, EnvCompactHistoryMixedTailStillRetainsUnit)  // NOLINT
+{
+  // A tail with even ONE non-REMOVE command must NOT trigger the (e) full-collapse override -
+  // retention proceeds normally and a window client is served a real delta, not refused.
+  auto env = getEnvironment();
+  const std::string removed_link = "t489e_mixed_removed";
+  EXPECT_TRUE(env->applyCommand(std::make_shared<AddLinkCommand>(Link(removed_link))));
+  EXPECT_TRUE(env->applyCommand(std::make_shared<RemoveLinkCommand>(removed_link)));
+  const std::int64_t external_revision_after_remove = env->getExternalRevision();
+
+  const std::string kept_link = "t489e_mixed_kept";
+  EXPECT_TRUE(env->applyCommand(std::make_shared<AddLinkCommand>(Link(kept_link))));
+
+  // Tail (retain_tail=2) = [RemoveLinkCommand(removed_link), AddLinkCommand(kept_link)] - mixed,
+  // not remove-only.
+  EXPECT_TRUE(env->compactHistory(2));
+
+  // Retention, not full collapse: the kept link survives in the live scene from the retained tail.
+  EXPECT_TRUE(env->getSceneGraph()->getLink(kept_link) != nullptr);
+
+  // The window client (caught up to just after the REMOVE) gets served the retained ADD as a real
+  // delta, not refused into a full collapse.
+  EnvironmentChanges changes = env->getChangesSince(external_revision_after_remove);
+  EXPECT_TRUE(changes.success);
+  ASSERT_EQ(changes.commands.size(), 1U);
+  EXPECT_EQ(changes.commands[0]->getType(), CommandType::ADD_LINK);
+}
+
+TEST(TesseractEnvironmentUnit, EnvCompactHistoryRemoveOnlyTailPartialRemovalUnit)  // NOLINT
+{
+  // Fable's case (iii): the removed links are a SUBSET of the live scene, not a full teardown. The
+  // remove-only tail still triggers full collapse - the baseline must equal whatever the live state
+  // legitimately is afterward, which correctly still includes the untouched surviving link.
+  auto env = getEnvironment();
+  const std::string surviving_link = "t489e_survivor";
+  EXPECT_TRUE(env->applyCommand(std::make_shared<AddLinkCommand>(Link(surviving_link))));
+
+  const std::size_t n_removed = 64;
+  std::vector<std::string> removed_names;
+  for (std::size_t i = 0; i < n_removed; ++i)
+  {
+    const std::string name = "t489e_partial_" + std::to_string(i);
+    removed_names.push_back(name);
+    EXPECT_TRUE(env->applyCommand(std::make_shared<AddLinkCommand>(Link(name))));
+  }
+  for (const auto& name : removed_names)
+    EXPECT_TRUE(env->applyCommand(std::make_shared<RemoveLinkCommand>(name)));
+
+  const std::int64_t external_revision_before = env->getExternalRevision();
+  EXPECT_TRUE(env->compactHistory(n_removed));  // tail = exactly the n_removed REMOVE commands
+
+  for (const auto& name : removed_names)
+    EXPECT_TRUE(env->getSceneGraph()->getLink(name) == nullptr);
+  EXPECT_TRUE(env->getSceneGraph()->getLink(surviving_link) != nullptr);
+  EXPECT_EQ(env->getExternalRevision(), external_revision_before);
+}
+
 TEST(TesseractEnvironmentUnit, EnvGetCommandHistoryAndExternalRevisionAtomicUnit)  // NOLINT
 {
   // T-398 §7a, fable's root-cause fix 2026-09-20: getCommandHistoryAndExternalRevision() must
