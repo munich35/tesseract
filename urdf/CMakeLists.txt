@@ -64,26 +64,8 @@ target_compile_options(urdf PRIVATE ${TESSERACT_COMPILE_OPTIONS_PRIVATE})
 target_compile_options(urdf PUBLIC ${TESSERACT_COMPILE_OPTIONS_PUBLIC})
 target_compile_definitions(urdf PUBLIC ${TESSERACT_COMPILE_DEFINITIONS})
 
-# [t51b P46 2026-07-12] PCL's cmake config leaks arch flags (-msse4.2 -mfpmath=sse -march=native
-# -mavx2) into this target via its imported-target interface. That silently switches Eigen's max
-# alignment to 32 bytes IN THIS LIBRARY ONLY (sizeof(Collision) 192 here vs 176 everywhere else),
-# so scene-graph objects CONSTRUCTED by the URDF parser have a different layout than the code that
-# later destroys them -> heap corruption ("munmap_chunk(): invalid pointer" at Release; latent under
-# O0 where symbol-binding luck masked it). Strip the arch flags off the imported PCL targets before
-# linking them; point-cloud parsing does not need host-specific SIMD codegen.
-foreach(_pcl_tgt ${PCL_IO_LIBRARIES})
-  if(TARGET ${_pcl_tgt})
-    get_target_property(_pcl_opts ${_pcl_tgt} INTERFACE_COMPILE_OPTIONS)
-    if(_pcl_opts)
-      list(FILTER _pcl_opts EXCLUDE REGEX "^-(march|mtune|mavx|msse|mfpmath)")
-      set_target_properties(${_pcl_tgt} PROPERTIES INTERFACE_COMPILE_OPTIONS "${_pcl_opts}")
-    endif()
-  endif()
-endforeach()
 target_link_libraries(urdf PRIVATE ${PCL_IO_LIBRARIES})
 target_include_directories(urdf PRIVATE ${PCL_INCLUDE_DIRS})
-# belt-and-braces: even if a flag slips through a non-target path, force the arch baseline LAST.
-target_compile_options(urdf PRIVATE -march=x86-64 -mtune=generic -mno-avx2 -mno-avx)
 target_compile_definitions(urdf PUBLIC TESSERACT_PARSE_POINT_CLOUDS="ON")
 
 target_include_directories(urdf PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
