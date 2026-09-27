@@ -2552,6 +2552,37 @@ bool Environment::compactHistory(std::size_t retain_tail)
         static_cast<std::int64_t>(history_snapshot.size()) - static_cast<std::int64_t>(retain_tail);
     const auto keep_from_signed = std::max<std::int64_t>(current_baseline_len, std::max<std::int64_t>(retain_lower_bound, 0));
     keep_from = static_cast<std::size_t>(keep_from_signed);
+
+    // T-489 (e) fix (fable's design, 2026-09-27): a tail made ENTIRELY of REMOVE_LINK/REMOVE_JOINT
+    // commands is retention working against itself. The candidate baseline (state as of keep_from,
+    // BEFORE these removes) would hold shared_ptr references to geometry the live scene no longer
+    // has - SceneGraph::clone() shares mesh data rather than duplicating it (verified: Link::clone()
+    // copy-constructs Visual/Collision, whose `geometry` member is a shared_ptr<const Geometry> with
+    // a defaulted, shallow copy constructor), so this is a REFERENCE-HOLD problem, not a byte-doubling
+    // one - but the effect is the same: memory that should be free stays live until the NEXT
+    // compaction discards this baseline. There is also no delta-serving benefit to retaining a
+    // remove-only tail: any client landing below the new floor gets a full refetch of the NEW,
+    // already-small/live baseline (cheap), and a client mid-removal getting reset onto the
+    // post-removal state is the desired behavior at a pack boundary, not a regression. Detect it and
+    // fully collapse (keep_from = captured_revision) instead of retaining.
+    if (keep_from < history_snapshot.size())
+    {
+      bool tail_is_remove_only = true;
+      for (std::size_t i = keep_from; i < history_snapshot.size(); ++i)
+      {
+        const CommandType t = history_snapshot[i]->getType();
+        if (t != CommandType::REMOVE_LINK && t != CommandType::REMOVE_JOINT)
+        {
+          tail_is_remove_only = false;
+          break;
+        }
+      }
+      if (tail_is_remove_only)
+      {
+        CONSOLE_BRIDGE_logInform("Environment::compactHistory: remove-only tail -> full collapse");
+        keep_from = history_snapshot.size();
+      }
+    }
   }
 
   // Nothing NEW to compact: keep_from never fell past the existing baseline's own boundary, which
